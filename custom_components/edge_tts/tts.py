@@ -3,6 +3,7 @@ import logging
 import time
 from typing import Any
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.components.tts import (
     CONF_LANG,
@@ -102,9 +103,10 @@ class EdgeTTSEntity(TextToSpeechEntity):
             options,
         )
 
-    def _process_tts_audio(
+    # Share voice and prosody resolution across both audio paths. Related: config_flow.py, const.py.
+    def _create_communicate(
         self, message: str, language: str, options: dict[str, Any]
-    ) -> bytes | None:
+    ) -> edge_tts.Communicate:
         opt = {CONF_LANG: language}
         if language in SUPPORTED_VOICES:
             opt[CONF_LANG] = SUPPORTED_VOICES[language]
@@ -123,16 +125,20 @@ class EdgeTTSEntity(TextToSpeechEntity):
                 )
                 break
 
-        _LOGGER.debug('%s: %s', self.name, [message, opt])
-        mp3 = b''
-        start_time = time.perf_counter()
-        tts = edge_tts.Communicate(
+        return edge_tts.Communicate(
             message,
             voice=voice,
             pitch=opt.get('pitch', '+0Hz'),
             rate=opt.get('rate', '+0%'),
             volume=opt.get('volume', '+0%'),
         )
+
+    def _process_tts_audio(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> bytes | None:
+        tts = self._create_communicate(message, language, options)
+        mp3 = b''
+        start_time = time.perf_counter()
         try:
             for chunk in tts.stream_sync():
                 if chunk["type"] == "audio":
@@ -150,23 +156,48 @@ class EdgeTTSEntity(TextToSpeechEntity):
     async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
         return TTSAudioResponse("mp3", self._process_tts_stream(request))
 
+    # Bound text batches and forward audio immediately. Related: tests/test_tts_stream.py.
+    async def _stream_message(
+        self, message: str, request: TTSAudioRequest
+    ) -> AsyncGenerator[bytes]:
+        """Forward audio while Edge is still synthesizing the current batch."""
+        tts = self._create_communicate(message, request.language, request.options)
+        start_time = time.perf_counter()
+        first_audio = True
+        _LOGGER.debug("Starting TTS batch: %s characters", len(message))
+        try:
+            async with aclosing(tts.stream()) as stream:
+                async for chunk in stream:
+                    if chunk["type"] == "audio":
+                        if first_audio:
+                            _LOGGER.debug(
+                                "First TTS audio after %.0f ms",
+                                (time.perf_counter() - start_time) * 1000,
+                            )
+                            first_audio = False
+                        yield chunk["data"]
+        except edge_tts.exceptions.NoAudioReceived as exc:
+            raise HomeAssistantError("Edge TTS received no audio for the batch") from exc
+
     async def _process_tts_stream(self, request: TTSAudioRequest) -> AsyncGenerator[bytes]:
         """Generate speech from an incoming message."""
-        _LOGGER.debug("Starting TTS Stream with options: %s", request.options)
+        _LOGGER.debug("Starting TTS stream")
         separators = ["\n", "。", ". ", "，", ", ", "；", "; ", "！", "! ", "？", "? ", "、"]
         buffer = ""
-        count = 0
         async for message in request.message_gen:
-            _LOGGER.debug("Streaming tts sentence: %s", message)
-            count += 1
-            min_len = 2 ** count * 10
             for char in message:
                 buffer += char
                 msg = buffer.strip()
-                if len(msg) < min_len:
-                    continue
-                if char in separators or buffer[-2:] in separators:
+                if len(buffer) >= 200 or (
+                    len(msg) >= 20
+                    and (char in separators or buffer[-2:] in separators)
+                ):
                     buffer = ""
-                    yield await self.async_process_tts_audio(msg, request.language, request.options)
+                    if msg:
+                        async with aclosing(self._stream_message(msg, request)) as stream:
+                            async for audio in stream:
+                                yield audio
         if msg := buffer.strip():
-            yield await self.async_process_tts_audio(msg, request.language, request.options)
+            async with aclosing(self._stream_message(msg, request)) as stream:
+                async for audio in stream:
+                    yield audio

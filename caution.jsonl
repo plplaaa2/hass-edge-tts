@@ -1,0 +1,1 @@
+{"date":"2026-11-22","note":"Streaming input messages may be individual tokens. Never grow the synthesis threshold with the number of incoming messages. Awaiting full-batch synthesis can starve live satellite playback. Verify playback has ended before changing ESPHome log subscription settings, which reload the connection."}
