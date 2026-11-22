@@ -107,6 +107,9 @@ class EdgeTTSEntity(TextToSpeechEntity):
     def _create_communicate(
         self, message: str, language: str, options: dict[str, Any]
     ) -> edge_tts.Communicate:
+        # Reject non-speech input before opening a network request. Related: intent.py.
+        if not any(char.isalnum() for char in message):
+            raise HomeAssistantError("Edge TTS requires text containing letters or numbers")
         opt = {CONF_LANG: language}
         if language in SUPPORTED_VOICES:
             opt[CONF_LANG] = SUPPORTED_VOICES[language]
@@ -151,33 +154,71 @@ class EdgeTTSEntity(TextToSpeechEntity):
         end_time = time.perf_counter()
         elapsed_time = (end_time - start_time) * 1000
         _LOGGER.debug("load tts elapsed_time: %sms", elapsed_time)
+        if not mp3:
+            raise HomeAssistantError("Edge TTS received no audio")
         return mp3
 
     async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
-        return TTSAudioResponse("mp3", self._process_tts_stream(request))
+        # Validate the first audio before HA starts MP3 conversion. Related: tests/test_tts_stream.py.
+        stream = self._process_tts_stream(request)
+        try:
+            first_audio = await anext(stream)
+        except StopAsyncIteration as exc:
+            raise HomeAssistantError(
+                "Edge TTS requires text containing letters or numbers"
+            ) from exc
+        except BaseException:
+            await stream.aclose()
+            raise
+
+        async def audio_stream():
+            async with aclosing(stream):
+                yield first_audio
+                async for audio in stream:
+                    yield audio
+
+        return TTSAudioResponse("mp3", audio_stream())
 
     # Bound text batches and forward audio immediately. Related: tests/test_tts_stream.py.
     async def _stream_message(
         self, message: str, request: TTSAudioRequest
     ) -> AsyncGenerator[bytes]:
         """Forward audio while Edge is still synthesizing the current batch."""
-        tts = self._create_communicate(message, request.language, request.options)
-        start_time = time.perf_counter()
-        first_audio = True
-        _LOGGER.debug("Starting TTS batch: %s characters", len(message))
-        try:
-            async with aclosing(tts.stream()) as stream:
-                async for chunk in stream:
-                    if chunk["type"] == "audio":
-                        if first_audio:
-                            _LOGGER.debug(
-                                "First TTS audio after %.0f ms",
-                                (time.perf_counter() - start_time) * 1000,
-                            )
-                            first_audio = False
-                        yield chunk["data"]
-        except edge_tts.exceptions.NoAudioReceived as exc:
-            raise HomeAssistantError("Edge TTS received no audio for the batch") from exc
+        # Skip punctuation-only tails; retry only before any audio is delivered.
+        if not any(char.isalnum() for char in message):
+            _LOGGER.debug("Skipping non-speech TTS batch: %s characters", len(message))
+            return
+        for attempt in range(2):
+            tts = self._create_communicate(message, request.language, request.options)
+            start_time = time.perf_counter()
+            audio_bytes = 0
+            _LOGGER.debug(
+                "Starting TTS batch: %s characters, attempt %s", len(message), attempt + 1
+            )
+            try:
+                async with aclosing(tts.stream()) as stream:
+                    async for chunk in stream:
+                        if chunk["type"] == "audio" and chunk["data"]:
+                            if not audio_bytes:
+                                _LOGGER.debug(
+                                    "First TTS audio after %.0f ms",
+                                    (time.perf_counter() - start_time) * 1000,
+                                )
+                            audio_bytes += len(chunk["data"])
+                            yield chunk["data"]
+                if not audio_bytes:
+                    raise edge_tts.exceptions.NoAudioReceived("Empty audio stream")
+                _LOGGER.debug("Completed TTS batch: %s audio bytes", audio_bytes)
+                return
+            except edge_tts.exceptions.NoAudioReceived as exc:
+                _LOGGER.warning(
+                    "Edge TTS batch failed: characters=%s, audio_bytes=%s, attempt=%s",
+                    len(message), audio_bytes, attempt + 1,
+                )
+                if audio_bytes or attempt:
+                    raise HomeAssistantError(
+                        "Edge TTS received no audio or an incomplete batch"
+                    ) from exc
 
     async def _process_tts_stream(self, request: TTSAudioRequest) -> AsyncGenerator[bytes]:
         """Generate speech from an incoming message."""

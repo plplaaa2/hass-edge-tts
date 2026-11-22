@@ -29,6 +29,9 @@ def load_entity():
         "SUPPORTED_LANGUAGES": {"ko-KR": "ko-KR-SunHiNeural"},
         "DEFAULT_LANG": "ko-KR",
         "DEFAULT_VOICE": "ko-KR-SunHiNeural",
+        "TTSAudioResponse": lambda extension, data_gen: SimpleNamespace(
+            extension=extension, data_gen=data_gen
+        ),
     }
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["EdgeTTSEntity"], namespace
@@ -46,6 +49,8 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.closed = []
         self.allow_finish = None
         self.error = None
+        self.errors = []
+        self.error_after_first = False
         test = self
 
         class Communicate:
@@ -54,9 +59,15 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
 
             async def stream(self):
                 try:
+                    if test.errors:
+                        error = test.errors.pop(0)
+                        if error:
+                            raise error
                     if test.error:
                         raise test.error
                     yield {"type": "audio", "data": b"first"}
+                    if test.error_after_first:
+                        raise test.no_audio()
                     if test.allow_finish:
                         await test.allow_finish.wait()
                     yield {"type": "SentenceBoundary"}
@@ -131,6 +142,46 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.error = self.no_audio()
         with self.assertRaisesRegex(RuntimeError, "no audio"):
             await self.collect(self.request(["오디오 오류입니다."]))
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_punctuation_tail_is_not_sent_to_edge(self):
+        text = "가" * 200
+        await self.collect(self.request([text, "...\n\n"]))
+        self.assertEqual([message for message, _ in self.calls], [text])
+
+    async def test_empty_public_request_fails_before_returning_audio_response(self):
+        for text in ("", "  \n", "...", "😊"):
+            with self.assertRaisesRegex(RuntimeError, "letters or numbers"):
+                await self.entity.async_stream_tts_audio(self.request([text]))
+        self.assertEqual(self.calls, [])
+
+    async def test_sync_request_rejects_non_speech_before_network(self):
+        with self.assertRaisesRegex(RuntimeError, "letters or numbers"):
+            self.entity._process_tts_audio("...\n", "ko-KR", {})
+        self.assertEqual(self.calls, [])
+
+    async def test_retry_before_audio_recovers_without_duplicate_audio(self):
+        self.errors = [self.no_audio(), None]
+        response = await self.entity.async_stream_tts_audio(self.request(["안녕하세요."]))
+        chunks = [chunk async for chunk in response.data_gen]
+        self.assertEqual(chunks, [b"first", b"last"])
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.closed), 2)
+
+    async def test_partial_audio_is_not_retried(self):
+        self.error_after_first = True
+        response = await self.entity.async_stream_tts_audio(self.request(["안녕하세요."]))
+        self.assertEqual(await anext(response.data_gen), b"first")
+        with self.assertRaises(RuntimeError):
+            await anext(response.data_gen)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_public_stream_close_propagates(self):
+        self.allow_finish = asyncio.Event()
+        response = await self.entity.async_stream_tts_audio(self.request(["안녕하세요."]))
+        self.assertEqual(await anext(response.data_gen), b"first")
+        await response.data_gen.aclose()
+        self.assertEqual(self.closed, [True])
 
 
 if __name__ == "__main__":

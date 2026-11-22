@@ -1,1 +1,2 @@
 {"version":"dev-0.7.8.1","date":"2026-11-22","changes":["Bound streaming text batches to 200 characters and forwarded Edge audio chunks immediately, preserving shared voice and prosody resolution.","Added isolated streaming regression tests."]}
+{"version":"dev-0.7.8.2","date":"2026-11-22","changes":["Skipped punctuation-only streaming batches, rejected non-speech requests before audio conversion, and retried no-audio batches once only before audio delivery.","Added batch diagnostics and regression coverage for public streaming entry points and partial failures."]}

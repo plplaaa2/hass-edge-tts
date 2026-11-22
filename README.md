@@ -4,6 +4,8 @@
 
 이 포크는 긴 Assist 응답을 문장 경계 또는 최대 200자에서 나누고, 생성 중인 오디오 조각을 즉시 전달합니다. 문장 사이의 과도한 생성 대기를 줄이기 위한 변경입니다.
 
+문장부호만 남은 구간은 건너뛰고, 빈 입력은 음성 변환 전에 오류로 안내합니다. 음성을 전혀 받지 못한 구간은 한 번 재시도하며, 구간 길이·시도 횟수·수신 바이트를 진단 로그에 기록합니다.
+
 로컬 회귀 검증은 `python -B -m unittest discover -s tests -v`로 실행합니다. 실제 음성 기기의 연속 재생은 설치 후 확인해야 합니다.
 
 This component is based on the TTS service of Microsoft Edge browser, no need to apply for `app_key`.
